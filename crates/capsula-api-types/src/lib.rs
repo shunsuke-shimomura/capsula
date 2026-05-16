@@ -60,6 +60,59 @@ pub struct HookFilter {
     pub output_filter: String,
 }
 
+/// Comparison operator for parameter matching
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOp {
+    /// Exact equality
+    Eq,
+    /// Not equal
+    Ne,
+    /// Greater than
+    Gt,
+    /// Greater than or equal
+    Ge,
+    /// Less than
+    Lt,
+    /// Less than or equal
+    Le,
+}
+
+/// A structured filter that matches a specific parameter value in hook output.
+///
+/// This provides a higher-level alternative to raw `JSONPath` expressions
+/// for common parameter matching scenarios (e.g., finding runs where
+/// `solar_flux ≈ 1361.0`).
+///
+/// For approximate matching, use two `ParameterMatch` entries with `ge` and `le`
+/// to define a range.
+///
+/// # Example
+///
+/// ```json
+/// {
+///     "hook_id": "capture-command",
+///     "phase": "pre",
+///     "parameter": "solar_flux",
+///     "operator": "ge",
+///     "value": 1347.39
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParameterMatch {
+    /// The hook ID whose output contains the parameter
+    pub hook_id: String,
+    /// Phase: "pre" or "post"
+    pub phase: String,
+    /// Dot-separated path to the parameter in the hook output JSON
+    /// (e.g., `"solar_flux"` or `"params.temperature"`)
+    pub parameter: String,
+    /// Comparison operator
+    pub operator: ComparisonOp,
+    /// Value to compare against (number, string, or boolean)
+    pub value: serde_json::Value,
+}
+
 /// Fields that can be included in search response
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -98,9 +151,17 @@ pub struct SearchRunsRequest {
     /// Filter by success (`exit_code` = 0) or failure (`exit_code` != 0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
-    /// Hook output filters (AND logic)
+    /// Hook output filters using `JSONPath` (AND logic)
     #[serde(default)]
     pub hook_filters: Vec<HookFilter>,
+    /// Structured parameter match filters (AND logic)
+    ///
+    /// Higher-level alternative to `hook_filters` for matching specific
+    /// parameter values in hook outputs. Each entry generates a SQL condition
+    /// that checks whether the hook output contains a parameter matching
+    /// the given operator and value.
+    #[serde(default)]
+    pub parameter_matches: Vec<ParameterMatch>,
     /// What to include in response
     #[serde(default)]
     pub include: Vec<IncludeField>,
