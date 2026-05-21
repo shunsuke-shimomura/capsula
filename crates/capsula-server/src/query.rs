@@ -3,7 +3,7 @@
 //! This module provides a builder for constructing dynamic SQL queries
 //! that filter runs based on metadata and hook outputs using `JSONPath` expressions.
 
-use crate::models::{HookFilter, SearchRunsRequest, SortOrder};
+use crate::models::{ComparisonOp, HookFilter, ParameterMatch, SearchRunsRequest, SortOrder};
 use chrono::{DateTime, Utc};
 use sql_json_path::JsonPath;
 use std::fmt::Write;
@@ -95,6 +95,10 @@ impl RunQueryBuilder {
 
         for hook_filter in &request.hook_filters {
             builder = builder.with_hook_filter(hook_filter)?;
+        }
+
+        for param_match in &request.parameter_matches {
+            builder = builder.with_parameter_match(param_match)?;
         }
 
         builder.order = request.order.clone();
@@ -197,6 +201,69 @@ impl RunQueryBuilder {
         Ok(self)
     }
 
+    /// Add a structured parameter match filter
+    ///
+    /// Generates a `JSONPath` expression from the structured match condition
+    /// and adds it as an EXISTS subquery on `run_outputs`.
+    ///
+    /// For example, `ParameterMatch { parameter: "solar_flux", operator: Ge, value: 1347.39 }`
+    /// generates: `jsonb_path_exists(ro.output, '$.solar_flux ? (@ >= 1347.39)'::jsonpath)`
+    pub fn with_parameter_match(
+        mut self,
+        param_match: &ParameterMatch,
+    ) -> Result<Self, QueryError> {
+        // Validate phase
+        let phase = match param_match.phase.as_str() {
+            "pre" | "post" => &param_match.phase,
+            _ => {
+                return Err(QueryError::InvalidJsonPath(
+                    "phase must be 'pre' or 'post'".to_string(),
+                ))
+            }
+        };
+
+        // Build JSONPath expression from the structured match
+        let jsonpath_expr = build_jsonpath_from_match(
+            &param_match.parameter,
+            &param_match.operator,
+            &param_match.value,
+        )?;
+
+        // Validate the generated JSONPath
+        Self::validate_jsonpath(&jsonpath_expr)?;
+
+        // Build EXISTS subquery
+        let mut subquery_conditions = vec![
+            "ro.run_id = r.id".to_string(),
+            format!("ro.hook_id = ${}", self.param_index),
+        ];
+        self.bind_values
+            .push(BindValue::String(param_match.hook_id.clone()));
+        self.param_index += 1;
+
+        // Add phase filter
+        subquery_conditions.push(format!("ro.phase = ${}", self.param_index));
+        self.bind_values
+            .push(BindValue::String(phase.clone()));
+        self.param_index += 1;
+
+        // Add JSONPath filter on output
+        subquery_conditions.push(format!(
+            "jsonb_path_exists(ro.output, ${}::jsonpath)",
+            self.param_index
+        ));
+        self.bind_values.push(BindValue::String(jsonpath_expr));
+        self.param_index += 1;
+
+        let exists_clause = format!(
+            "EXISTS (SELECT 1 FROM run_outputs ro WHERE {})",
+            subquery_conditions.join(" AND ")
+        );
+        self.hook_exists_clauses.push(exists_clause);
+
+        Ok(self)
+    }
+
     /// Validate a `JSONPath` expression using SQL/JSON path parser
     ///
     /// Uses `sql-json-path` crate which is compatible with `PostgreSQL`'s SQL/JSON
@@ -280,6 +347,55 @@ impl RunQueryBuilder {
     }
 }
 
+/// Build a PostgreSQL-compatible `JSONPath` expression from a structured match condition.
+///
+/// Converts a parameter path, operator, and value into a `JSONPath` expression like:
+/// `$.solar_flux ? (@ >= 1347.39)`
+///
+/// For nested parameters (e.g., "params.temperature"), generates:
+/// `$.params.temperature ? (@ >= 300.0)`
+fn build_jsonpath_from_match(
+    parameter: &str,
+    operator: &ComparisonOp,
+    value: &serde_json::Value,
+) -> Result<String, QueryError> {
+    // Validate parameter name (prevent injection)
+    if parameter.is_empty() || parameter.len() > 200 {
+        return Err(QueryError::InvalidJsonPath(
+            "parameter name must be 1-200 characters".to_string(),
+        ));
+    }
+    for ch in parameter.chars() {
+        if !ch.is_alphanumeric() && ch != '_' && ch != '.' {
+            return Err(QueryError::InvalidJsonPath(format!(
+                "parameter name contains invalid character: '{ch}'"
+            )));
+        }
+    }
+
+    let op_str = match operator {
+        ComparisonOp::Eq => "==",
+        ComparisonOp::Ne => "!=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Ge => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Le => "<=",
+    };
+
+    let value_str = match value {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => {
+            return Err(QueryError::InvalidJsonPath(
+                "parameter match value must be a number, string, or boolean".to_string(),
+            ))
+        }
+    };
+
+    Ok(format!("$.{parameter} ? (@ {op_str} {value_str})"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +431,107 @@ mod tests {
             output_filter: "not-starting-with-dollar".to_string(),
         };
         let result = RunQueryBuilder::new().with_hook_filter(&filter);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parameter_match_numeric() {
+        let pm = ParameterMatch {
+            hook_id: "capture-command".to_string(),
+            phase: "pre".to_string(),
+            parameter: "solar_flux".to_string(),
+            operator: ComparisonOp::Ge,
+            value: serde_json::json!(1347.39),
+        };
+        let builder = RunQueryBuilder::new()
+            .with_parameter_match(&pm)
+            .expect("valid parameter match");
+        let query = builder.build_query();
+        assert!(query.contains("EXISTS"));
+        assert!(query.contains("ro.phase = $"));
+        assert!(query.contains("jsonb_path_exists"));
+    }
+
+    #[test]
+    fn test_parameter_match_string() {
+        let pm = ParameterMatch {
+            hook_id: "capture-env".to_string(),
+            phase: "pre".to_string(),
+            parameter: "orbit_type".to_string(),
+            operator: ComparisonOp::Eq,
+            value: serde_json::json!("LEO"),
+        };
+        let builder = RunQueryBuilder::new()
+            .with_parameter_match(&pm)
+            .expect("valid parameter match");
+        let query = builder.build_query();
+        assert!(query.contains("EXISTS"));
+    }
+
+    #[test]
+    fn test_parameter_match_invalid_phase() {
+        let pm = ParameterMatch {
+            hook_id: "test".to_string(),
+            phase: "invalid".to_string(),
+            parameter: "x".to_string(),
+            operator: ComparisonOp::Eq,
+            value: serde_json::json!(1),
+        };
+        let result = RunQueryBuilder::new().with_parameter_match(&pm);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parameter_match_nested() {
+        let pm = ParameterMatch {
+            hook_id: "capture-command".to_string(),
+            phase: "post".to_string(),
+            parameter: "results.max_temperature".to_string(),
+            operator: ComparisonOp::Le,
+            value: serde_json::json!(85.0),
+        };
+        let builder = RunQueryBuilder::new()
+            .with_parameter_match(&pm)
+            .expect("valid parameter match");
+        let query = builder.build_query();
+        assert!(query.contains("EXISTS"));
+    }
+
+    #[test]
+    fn test_build_jsonpath_exact_number() {
+        let expr =
+            build_jsonpath_from_match("solar_flux", &ComparisonOp::Eq, &serde_json::json!(1361.0))
+                .unwrap();
+        assert_eq!(expr, "$.solar_flux ? (@ == 1361.0)");
+    }
+
+    #[test]
+    fn test_build_jsonpath_range() {
+        let lower =
+            build_jsonpath_from_match("temp", &ComparisonOp::Ge, &serde_json::json!(10.0))
+                .unwrap();
+        let upper =
+            build_jsonpath_from_match("temp", &ComparisonOp::Le, &serde_json::json!(90.0))
+                .unwrap();
+        assert_eq!(lower, "$.temp ? (@ >= 10.0)");
+        assert_eq!(upper, "$.temp ? (@ <= 90.0)");
+    }
+
+    #[test]
+    fn test_build_jsonpath_string_value() {
+        let expr =
+            build_jsonpath_from_match("orbit", &ComparisonOp::Eq, &serde_json::json!("LEO"))
+                .unwrap();
+        assert_eq!(expr, r#"$.orbit ? (@ == "LEO")"#);
+    }
+
+    #[test]
+    fn test_build_jsonpath_invalid_param_name() {
+        let result = build_jsonpath_from_match(
+            "solar flux; DROP TABLE",
+            &ComparisonOp::Eq,
+            &serde_json::json!(1),
+        );
         assert!(result.is_err());
     }
 

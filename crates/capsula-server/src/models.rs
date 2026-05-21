@@ -91,9 +91,12 @@ pub struct SearchRunsRequest {
     pub exit_code: Option<i32>,
     /// Filter by success (`exit_code` = 0) or failure (`exit_code` != 0)
     pub success: Option<bool>,
-    /// Hook output filters (AND logic)
+    /// Hook output filters using `JSONPath` (AND logic)
     #[serde(default)]
     pub hook_filters: Vec<HookFilter>,
+    /// Structured parameter match filters (AND logic)
+    #[serde(default)]
+    pub parameter_matches: Vec<ParameterMatch>,
     /// What to include in response
     #[serde(default)]
     pub include: Vec<IncludeField>,
@@ -104,6 +107,28 @@ pub struct SearchRunsRequest {
     pub limit: Option<i64>,
     /// Offset for pagination
     pub offset: Option<i64>,
+}
+
+/// Comparison operator for parameter matching
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+/// Structured filter for matching parameter values in hook output
+#[derive(Debug, Deserialize)]
+pub struct ParameterMatch {
+    pub hook_id: String,
+    pub phase: String,
+    pub parameter: String,
+    pub operator: ComparisonOp,
+    pub value: JsonValue,
 }
 
 /// A filter condition on a hook's config or output using `JSONPath`
